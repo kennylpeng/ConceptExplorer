@@ -1,152 +1,119 @@
-"""Feature-budgeted predictive models for binary UCE concept activations."""
+"""Joint concept selection by tuning L1 regularization to a requested support size."""
 import numpy as np
-import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.feature_selection import SelectFromModel
-from sklearn.linear_model import LogisticRegression, Lasso, Ridge
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score, r2_score, mean_absolute_error
-from sklearn.model_selection import (train_test_split, GridSearchCV, StratifiedKFold, KFold,
-                                     GroupShuffleSplit, GroupKFold)
-from sklearn.pipeline import Pipeline
+from scipy import sparse
+from sklearn.linear_model import LogisticRegression, Lasso
+from sklearn.preprocessing import StandardScaler
+from ._utils import integer, targets, result
 
 
-class MinCountFilter(BaseEstimator, TransformerMixin):
-    """Discard features occurring in fewer than min_count training rows (fit within CV)."""
-    def __init__(self, min_count=10):
-        self.min_count = min_count
-
-    def fit(self, X, y=None):
-        if self.min_count < 1:
-            raise ValueError('min_count must be positive')
-        self.indices_ = np.flatnonzero(np.asarray((X > 0).sum(axis=0)).ravel() >= self.min_count)
-        if not len(self.indices_):
-            raise ValueError('No features satisfy min_count in this training fold')
-        return self
-
-    def transform(self, X):
-        return X[:, self.indices_]
-
-
-def _fit_budgeted(self, y, *, kind, n_concepts=5, min_count=10, test_size=0.2,
-                  scoring=None, random_state=42, groups=None):
-    if n_concepts < 1:
-        raise ValueError('n_concepts must be >= 1')
-    X = self.Z.tocsr().astype(float)[:, np.flatnonzero(self.allowed)]
-    allowed_ids = np.flatnonzero(self.allowed)
-    if not len(allowed_ids):
-        raise ValueError('No concepts pass the fidelity filter')
-    y = np.asarray(y)
-    if y.ndim != 1 or len(y) != X.shape[0]:
-        raise ValueError('y must have one value per document')
-    if kind == 'continuous':
-        y = y.astype(float)
-        valid = np.isfinite(y)
-    else:
-        valid = ~pd.isna(y)
-    X, y = X[valid], y[valid]
-    if groups is not None:
-        groups = np.asarray(groups)
-        if len(groups) != len(valid):
-            raise ValueError('groups length mismatch')
-        groups = groups[valid]
-    if len(y) < 12:
-        raise ValueError('Need at least 12 observations')
-    if kind == 'categorical':
-        if len(np.unique(y)) != 2:
-            raise ValueError('classifier currently supports exactly two classes')
-    elif kind == 'continuous':
-        if np.std(y) == 0:
-            raise ValueError('Continuous target must vary')
-    else:
+def _select_joint(explorer, y, *, kind='categorical', n_concepts=20, min_count=10,
+                  activations='binary', random_state=42):
+    if kind not in ('categorical', 'continuous'):
         raise ValueError("kind must be 'categorical' or 'continuous'")
-
-    idx = np.arange(len(y))
-    if groups is None:
-        itr, ite = train_test_split(idx, test_size=test_size, random_state=random_state,
-                                    stratify=y if kind == 'categorical' else None)
-        cv = (StratifiedKFold(3, shuffle=True, random_state=random_state)
-              if kind == 'categorical' else KFold(3, shuffle=True, random_state=random_state))
-        fit_groups = None
-    else:
-        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-        itr, ite = next(splitter.split(X, y, groups))
-        cv = GroupKFold(n_splits=3)
-        fit_groups = groups[itr]
-    if kind == 'categorical' and (len(np.unique(y[itr])) < 2 or len(np.unique(y[ite])) < 2):
-        raise ValueError('Both classes must appear in train and test; try a different split')
-
+    if activations not in ('binary', 'raw'):
+        raise ValueError("activations must be 'binary' or 'raw'")
+    n_concepts = integer(n_concepts, 'n_concepts', minimum=1)
+    min_count = integer(min_count, 'min_count')
+    y, valid = targets(y, explorer.Z.shape[0], 'y', continuous=kind == 'continuous')
+    if len(y) < 2:
+        raise ValueError('Need at least two valid observations')
+    classes = None
     if kind == 'categorical':
-        selector = LogisticRegression(penalty='l1', solver='liblinear', max_iter=4000,
-                                      random_state=random_state)
-        final = LogisticRegression(max_iter=4000, random_state=random_state)
-        params = {'select__estimator__C': [0.1, 1, 10], 'model__C': [0.1, 1, 10]}
-        scoring = scoring or 'balanced_accuracy'
+        classes, target = np.unique(y, return_inverse=True)
+        if len(classes) != 2:
+            raise ValueError('Categorical joint selection supports exactly two classes')
+        target = target.astype(float)
     else:
-        # Standardize target for Lasso alpha stability, then Ridge refit in original units.
-        # Alpha grid is rescaled to target std (Lasso's alpha has units of target).
-        selector = Lasso(max_iter=8000, random_state=random_state)
-        final = Ridge(solver='lsqr')
-        scale = max(float(np.std(y[itr])), 1e-8)
-        params = {'select__estimator__alpha': [0.001*scale, 0.01*scale, 0.1*scale],
-                  'model__alpha': [0.1, 1, 10]}
-        scoring = scoring or 'r2'
+        target = y
+        if np.std(target) == 0:
+            raise ValueError('Continuous target must vary')
 
-    pipe = Pipeline([
-        ('filter', MinCountFilter(min_count=min_count)),
-        ('select', SelectFromModel(selector, max_features=n_concepts, threshold=-np.inf)),
-        ('model', final)
-    ])
-    search = GridSearchCV(pipe, params, cv=cv, scoring=scoring, n_jobs=1, error_score='raise')
-    search.fit(X[itr], y[itr], groups=fit_groups)
-    best = search.best_estimator_
-    predictions = best.predict(X[ite])
-    metrics = {'cv_score': float(search.best_score_), 'best_params': search.best_params_,
-               'n_train': len(itr), 'n_test': len(ite), 'scoring': scoring}
+    # Frequency always means threshold-crossing documents, even for raw fits.
+    counts = np.asarray(explorer.binary[valid].sum(axis=0)).ravel()
+    ids = np.flatnonzero(explorer.allowed & (counts >= min_count))
+    if not len(ids):
+        raise ValueError('No eligible concepts satisfy min_count')
+    source = explorer.binary if activations == 'binary' else explorer.Z
+    X = sparse.csr_matrix(source[valid][:, ids], dtype=float)
+    if not np.isfinite(X.data).all():
+        raise ValueError('Activations must be finite on valid-target rows')
+    scaler = StandardScaler(with_mean=False).fit(X)
+    varying = scaler.var_ > 0
+    ids = ids[varying]
+    if not len(ids):
+        raise ValueError('No eligible concepts have variable activations')
+    scales = scaler.scale_[varying]
+    X = scaler.transform(X)[:, varying].tocsr()
+    centered = target - target.mean()
+    max_strength = max(float(np.max(np.abs(X.T @ centered))) / len(target), 1e-12)
+    candidates = {}
+    tolerance = 1e-8
+    # New sklearn versions select the penalty through l1_ratio. Older versions
+    # require penalty='l1'; detect the constructor default without version pins.
+    l1_options = {}
     if kind == 'categorical':
-        metrics['test_balanced_accuracy'] = float(balanced_accuracy_score(y[ite], predictions))
-        probabilities = best.predict_proba(X[ite])[:, 1]
-        metrics['test_auc'] = float(roc_auc_score((y[ite] == best.classes_[1]).astype(int), probabilities))
-    else:
-        metrics['test_r2'] = float(r2_score(y[ite], predictions))
-        metrics['test_mae'] = float(mean_absolute_error(y[ite], predictions))
+        default_penalty = LogisticRegression().get_params().get('penalty', 'deprecated')
+        l1_options = {'l1_ratio': 1.0} if default_penalty == 'deprecated' else {'penalty': 'l1'}
 
-    selected_local = best.named_steps['filter'].indices_[best.named_steps['select'].get_support(indices=True)]
-    concept_ids = allowed_ids[selected_local]
-    train_counts = np.asarray((X[itr] > 0).sum(axis=0)).ravel()
-    coefs = np.asarray(best.named_steps['model'].coef_).ravel()
-    table = pd.DataFrame({
-        'concept_id': concept_ids,
-        'concept_label': [self.name(i) for i in concept_ids],
-        'train_count': train_counts[selected_local],
-        'coefficient': coefs,
-    }).sort_values('coefficient', key=lambda x: x.abs(), ascending=False).reset_index(drop=True)
-    if self.fidelity is not None:
-        table['fidelity'] = self.fidelity[table.concept_id.to_numpy()]
-    metrics['n_selected'] = len(concept_ids)
-    metrics['n_eligible_concepts'] = len(allowed_ids)
-    # best pipeline expects self.Z restricted to allowed_ids (same ordering as used in fit).
-    return best, metrics, table
+    def evaluate(log_strength):
+        strength = float(np.exp(log_strength))
+        if kind == 'categorical':
+            estimator = LogisticRegression(solver='liblinear', **l1_options,
+                                           C=1 / (len(target) * strength),
+                                           max_iter=10000, tol=1e-8,
+                                           random_state=random_state)
+        else:
+            estimator = Lasso(alpha=strength, max_iter=10000, tol=1e-8,
+                              random_state=random_state)
+        estimator.fit(X, target)
+        coef = np.asarray(estimator.coef_).ravel().copy()
+        count = int(np.count_nonzero(np.abs(coef) > tolerance))
+        candidates[log_strength] = (count, coef, strength)
+        return count
 
+    # Sample a broad path first, then refine every bracket crossing the requested
+    # count. Supports can jump or be nonmonotone; no exact-size guarantee is made.
+    grid = np.linspace(np.log(max_strength) + np.log(100),
+                       np.log(max_strength) + np.log(1e-8), 25)
+    exact = False
+    for value in grid:
+        if evaluate(float(value)) == n_concepts:
+            exact = True
+            break
+    for _ in range(40):
+        if exact:
+            break
+        values = sorted(candidates)
+        brackets = [(a, b) for a, b in zip(values, values[1:])
+                    if (candidates[a][0] - n_concepts) * (candidates[b][0] - n_concepts) < 0
+                    and b - a > 1e-10]
+        if not brackets:
+            break
+        a, b = max(brackets, key=lambda pair: pair[1] - pair[0])
+        exact = evaluate((a + b) / 2) == n_concepts
 
-def classifier(self, y, n_concepts=5, min_count=10, test_size=0.2,
-               scoring='balanced_accuracy', random_state=42, groups=None):
-    """L1-select up to n_concepts, refit logistic regression, test on held-out rows.
-
-    Optional groups avoids group overlap in train/test and in cross-validation.
-    Returned pipeline expects `self.Z[:, self.allowed]` as input.
-    """
-    return _fit_budgeted(self, y, kind='categorical', n_concepts=n_concepts,
-                         min_count=min_count, test_size=test_size, scoring=scoring,
-                         random_state=random_state, groups=groups)
-
-
-def regressor(self, y, n_concepts=5, min_count=10, test_size=0.2,
-              scoring='r2', random_state=42, groups=None):
-    """Lasso-select up to n_concepts, refit Ridge regression, evaluate held-out R²/MAE.
-
-    Optional groups avoids group overlap in train/test and in cross-validation.
-    Returned pipeline expects `self.Z[:, self.allowed]` as input.
-    """
-    return _fit_budgeted(self, y, kind='continuous', n_concepts=n_concepts,
-                         min_count=min_count, test_size=test_size, scoring=scoring,
-                         random_state=random_state, groups=groups)
+    # Prefer fewer concepts on equal distance, then stronger regularization.
+    chosen = min(candidates, key=lambda value: (
+        abs(candidates[value][0] - n_concepts),
+        candidates[value][0] > n_concepts, -value))
+    count, coef, strength = candidates[chosen]
+    selected = np.flatnonzero(np.abs(coef) > tolerance)
+    coefficients = coef[selected] / scales[selected]
+    order = np.argsort(-np.abs(coefficients), kind='stable')
+    selected_ids = ids[selected][order]
+    data = {
+        'concept_id': selected_ids,
+        'concept_label': [explorer.concept_dict[i]['label'] for i in selected_ids],
+        'activation_count': counts[selected_ids].astype(int),
+        'coefficient': coefficients[order],
+    }
+    metadata = dict(kind=kind, activations=activations, n_observations=len(y),
+                    n_dropped=int((~valid).sum()), n_requested=n_concepts,
+                    n_selected=count, exact_match=count == n_concepts,
+                    n_eligible_concepts=len(ids), coefficient_tolerance=tolerance,
+                    penalty={'C': 1 / (len(target) * strength)} if kind == 'categorical'
+                    else {'alpha': strength}, n_fits=len(candidates))
+    if classes is not None:
+        value = classes[1]
+        metadata['positive_class'] = value.item() if isinstance(value, np.generic) else value
+    return result(data, **metadata)

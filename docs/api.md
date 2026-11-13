@@ -1,261 +1,250 @@
 # API reference
 
 ```python
-from uce_concept_explorer import ConceptExplorer, load_metadata
+from uce_concept_explorer import ConceptExplorer
 ```
 
-## Metadata and construction
+For a runnable example, see the [README](../README.md). For model loading, see
+[encoding](encoding.md). Statistical formulas are in [methodology](methodology.md).
 
-### `load_metadata(repo_id="klpeng/uce-gemma-80k", revision=None)`
-
-Loads concept metadata without downloading encoder weights. `repo_id` can be a
-Hugging Face repository ID or a local model directory; `revision` selects a Hub
-branch, tag, or commit.
-
-Returns the UCE package's `ConceptMetadata.from_pretrained()` result when
-available. Otherwise, returns a `pandas.DataFrame` assembled from `labels.csv`
-and any available `prevalences.csv` and `fidelities.csv` files.
+## Construction
 
 ```python
-metadata = load_metadata('klpeng/uce-gemma-80k')
-# Reuse an already-downloaded model directory:
-metadata = load_metadata(model_dir)
+E = ConceptExplorer(Z, texts, concept_dict, binary_threshold=0.92)
 ```
 
-### `ConceptExplorer(X, texts, metadata, threshold=0.92, min_fidelity=None, fidelity_field="f1", baseline_threshold=None)`
+| Parameter | Meaning |
+| --- | --- |
+| `Z` | Dense array or SciPy sparse matrix with shape `(n_documents, n_concepts)`. |
+| `texts` | One document text per matrix row, in the same order. |
+| `concept_dict` | Dictionary keyed by integer concept IDs `0` through `n_concepts - 1`; each entry must contain a nonempty string `label`. Additional fields are retained. |
+| `binary_threshold` | Number in `[0, 1]`. Binary activation uses the strict comparison `Z > binary_threshold`. |
 
-Creates an explorer from an already-encoded score matrix. `X` can be a dense
-NumPy array or SciPy sparse matrix with shape `(n_documents, n_concepts)`.
-`texts` contains one plain string per row, in the same order. `metadata` accepts
-a DataFrame or an object exposing `.to_dataframe()` or `.describe(ids)`;
-metadata concept ID *i* must describe matrix column *i*.
+Construction copies the scores into a CSR matrix and copies the concept
+dictionary. At least one document is required. Obtain an aligned dictionary
+from `model.concept_dict` or UCE's dictionary-only loader; see the encoding guide.
 
-The explorer stores raw scores in `E.raw` and binary activations in `E.Z`, using
-the strict comparison `X > threshold`. `threshold` must be between 0 and 1.
-Analyses use binary activations; raw scores determine the ordering of examples.
-`min_fidelity` applies an initial filter using `fidelity_field` (see
-`set_fidelity_filter()` below). `E.allowed` is the Boolean mask of eligible
-concept columns.
+## Attributes and filtering
 
-`baseline_threshold` selects the reference-corpus prevalence columns used by
-`enriched()` and `by_category(reference='corpus')`. It defaults to `threshold`.
-Supply the calibrated UCE-to-reference threshold mapping when the numerical
-values differ; the explorer does not infer or interpolate that mapping.
+| Attribute | Meaning |
+| --- | --- |
+| `E.Z` | Original scores as a CSR matrix. |
+| `E.binary` | CSR matrix of binary activations computed at construction. |
+| `E.texts` | Document texts in matrix-row order. |
+| `E.concept_dict` | Concept metadata keyed by matrix column ID. |
+| `E.counts` | Binary activation counts over the full dataset, in concept ID order. |
+| `E.allowed` | Boolean eligibility mask in concept ID order; initially all true. Used by every method. |
+
+To restrict concepts using optional fidelity metadata:
 
 ```python
-E = ConceptExplorer(X, texts, metadata, threshold=0.92)
-# If the documented calibration maps UCE 0.92 to reference 0.05:
-E = ConceptExplorer(X, texts, metadata, threshold=0.92, baseline_threshold=0.05)
+import numpy as np
+import pandas as pd
+
+f1 = pd.to_numeric(
+    [E.concept_dict[i].get('f1') for i in range(E.Z.shape[1])], errors='coerce',
+)
+E.allowed = np.isfinite(f1) & (f1 >= .8)
+# E.allowed[:] = True  # Clear the filter.
 ```
 
-## Methods
+Fidelity metrics do not change statistical calculations; they only affect
+eligibility when you use them to set `E.allowed`.
 
-Table results identify concepts with `concept_id` and `concept_label`. Search
-and descriptive ranking tables also include `fidelity` once a fidelity metric
-has been loaded. See [Statistical methods and interpretation](methodology.md)
-for uncertainty estimates, reference calibration, and modeling assumptions.
+## Result format
 
-### `E.name(concept_id)`
-
-Returns the full concept label as a string. This lookup works even when the
-concept is excluded by the fidelity filter. Raises `IndexError` for an ID outside
-the matrix's column range.
+Every individual result is a plain dictionary:
 
 ```python
-label = E.name(42)
+{
+    'data': {
+        'concept_id': [0, 2],
+        'concept_label': ['Politics', 'Food'],
+        'activation_count': [12, 8],
+        # Additional columns depend on the method.
+    },
+    'metadata': {'n_observations': 20},
+}
 ```
 
-### `E.set_fidelity_filter(min_fidelity=None, field="f1")`
-
-Updates `E.allowed` to keep concepts whose numeric `field` value is finite and
-at least `min_fidelity`. Missing or nonnumeric values are excluded. Raises
-`ValueError` if the requested metadata column is absent. Calling with no minimum
-clears the eligibility filter. Returns `E`, so calls can be chained.
-
-The filter affects search, examples, descriptive rankings, and modeling feature
-availability. UCE fidelity F1 comes from a limited, conditionally balanced
-evaluation sample; it does not estimate corpus-population performance.
+`data` contains equal-length Python lists in result order. An empty result
+retains its column names with empty lists. `metadata` holds sample sizes and
+analysis details, separate from the columns.
 
 ```python
-E.set_fidelity_filter(min_fidelity=0.8, field='f1')
-E.set_fidelity_filter()  # Allow all concepts again.
+result = E.prevalent()
+table = pd.DataFrame(result['data'])
+# For a bar chart:
+# plt.barh(result['data']['concept_label'], result['data']['prevalence'])
 ```
 
-### `E.search(query, max_results=30, all_active=False)`
-
-Searches full concept labels using a case-insensitive, literal substring.
-Returns up to `max_results` eligible concepts, sorted by descending activation
-count and then label, with a `count` column. Set `all_active=True` to require at
-least one activation in this dataset; otherwise, matching inactive concepts can
-also appear.
+`enrichment()` and `risk()` return **category → result** dictionaries:
 
 ```python
-matches = E.search('poetry', max_results=30, all_active=True)
+results = E.enrichment(labels)
+category_result = results['Democrat']  # Use a category present in labels.
+table = pd.DataFrame(category_result['data'])
 ```
 
-### `E.examples(concept_id, n=10)`
+Every data dictionary includes `concept_id` and the full `concept_label`.
+Concept IDs identify columns of the original activation matrix. Ranking scores
+are used internally and are not returned.
 
-Returns up to `n` texts whose concept score exceeds the explorer's threshold,
-ordered by descending raw activation. The DataFrame contains `concept_id`,
-`concept_label`, `activation`, `text_id` (the original matrix row index), and
-the full `text`. Raises `ValueError` if the concept fails the fidelity filter.
+## Shared input rules
 
-```python
-examples = E.examples(42, n=10)
-```
+- Categorical targets must be strings or numbers with comparable class values
+  (use all strings or all numbers). Targets must have one entry per document.
+- Missing targets (`None`, `NaN`, `pd.NA`) and nonfinite numeric targets are
+  omitted with their matrix rows, consistently across comparisons and selection.
+  Metadata reports `n_observations` and `n_dropped`.
+- `min_count` is a nonnegative integer counting binary threshold crossings
+  among the documents used by that method. It applies in raw mode too.
+- Result limits (`max_results`, `n`, `top_n`) are nonnegative integers; zero
+  returns empty columns. `n_concepts` must be a positive integer.
+- Raw comparisons require finite scores in `[0, 1]` on valid-target rows.
+- Invalid arguments raise `ValueError`; an invalid dictionary structure can
+  raise `TypeError`. No eligible comparison concepts produces an empty result.
 
-### `E.prevalent(top_n=20, min_count=1)`
+## `E.search(query, max_results=30, all_active=False)`
 
-Ranks eligible concepts by the lower endpoint of their 95% Wilson prevalence
-interval. Requires at least `min_count` activating documents and returns up to
-`top_n` rows with `count`, `prevalence`, `low`, and `high`. Prevalence is the
-fraction of all dataset documents activating the concept.
+Find a case-insensitive literal substring in eligible concept labels.
+`query` must be a string. `all_active=True` requires at least one binary
+activation; otherwise concepts with zero activations can match.
 
-```python
-common = E.prevalent(top_n=20, min_count=5)
-```
+**Data:** `concept_id`, `concept_label`, `activation_count` (full dataset).
+**Metadata:** `n_observations` (full dataset size).
+**Order:** descending activation count, then label. Up to `max_results` rows.
 
-### `E.enriched(top_n=20, multiplicative=False, min_count=5)`
+## `E.examples(concept_id, n=10)`
 
-Compares the full dataset's concept prevalence with the UCE general-corpus
-baseline. By default, `enrichment` is the prevalence difference; with
-`multiplicative=True`, it is the prevalence ratio. Concepts need at least
-`min_count` dataset activations. Undefined ratios with zero reference prevalence
-are excluded.
+Retrieve documents whose raw concept score exceeds the construction threshold.
+`concept_id` must be an integer within the matrix columns and eligible under
+`E.allowed`. Fractional, negative, and out-of-range IDs raise `ValueError`.
 
-Returns up to `top_n` rows, sorted by descending conservative lower bound, with
-`count`, `prevalence`, `reference_prevalence`, `enrichment`, `low`, `high`, and
-`rank_bound`. The corpus baseline uses its supplied one-sided 99% upper bound
-for conservative ranking; the displayed bounds are provisional rather than
-calibrated two-sample confidence intervals.
+| Data field | Meaning |
+| --- | --- |
+| `concept_id`, `concept_label` | Requested concept repeated on every row. |
+| `activation` | Raw activation score for the document and concept. |
+| `text_id` | Zero-based original matrix row index, for alignment with external metadata. |
+| `text` | Full document text. |
 
-The metadata must contain baseline columns matching `E.baseline_threshold`,
-such as `prevalence_gt_0p05` and `prevalence_gt_0p05_upper_99` for `0.05`.
-Raises `ValueError` when the required columns are missing. Configure the
-calibrated threshold at construction as described above.
+**Metadata:** empty dictionary.
+**Order:** descending raw activation, ties by original row index. Up to `n` rows.
 
-```python
-enrichment = E.enriched(top_n=20, multiplicative=False, min_count=5)
-```
+## `E.prevalent(top_n=20, min_count=10)`
 
-### `E.by_category(labels, top_n=15, multiplicative=False, min_count=5, reference='rest')`
+Rank eligible concepts by frequency over the full dataset.
 
-Ranks enriched concepts separately for each category. `labels` supplies one
-category per document in matrix-row order. With `reference='rest'`, each
-category is compared with all other documents, so each comparison needs both
-category and reference documents. With `reference='corpus'`, each category is
-compared with the general-corpus baseline and requires the baseline metadata
-described under `enriched()`.
+| Data field | Meaning |
+| --- | --- |
+| `activation_count` | Number of activating documents. |
+| `prevalence` | `activation_count / n_observations`, in `[0, 1]`. |
 
-Returns a dictionary mapping category values to enrichment DataFrames with the
-same columns as `enriched()`. `top_n` applies separately to each category, and
-`min_count` counts activations within that category. `multiplicative=True`
-selects ratios instead of differences. Both modes rank by the lower bound.
+**Metadata:** `n_observations` (full dataset size).
+**Order:** descending count, ties by concept ID. Up to `top_n` rows.
 
-```python
-by_party = E.by_category(labels, top_n=15, multiplicative=True, reference='rest')
-```
+## `E.enrichment(labels, metric='difference', top_n=15, min_count=10, confidence_level=0.99, activations='binary')`
 
-### `E.predictive(y, kind='categorical', top_n=20, min_count=5)`
+For each category, compare mean concept activation in that category with the
+remaining valid documents. Requires at least two categories.
 
-Ranks individual concepts by their association with a target containing one
-value per document. This is a descriptive, univariate ranking computed on the
-supplied data; it does not fit a held-out predictive model.
+| Parameter | Meaning |
+| --- | --- |
+| `labels` | One category per original document. |
+| `metric` | `'difference'` computes `category_mean - reference_mean`; `'ratio'` computes `category_mean / reference_mean`. |
+| `top_n` | Maximum concepts per category. |
+| `min_count` | Minimum binary activations across **all valid-target documents**. |
+| `confidence_level` | Number strictly between 0 and 1; controls `low` and `high`. |
+| `activations` | `'binary'` compares prevalences; `'raw'` compares mean raw scores and requires at least two documents in each category and its reference sample. |
 
-For `kind='categorical'`, compares each class with all remaining classes and
-keeps the comparison with the largest conservative lower bound on absolute
-prevalence separation. Returns `best_class`, signed `prevalence_difference`,
-`low`, `high`, and `separation_LCB`, sorted by the last column. Use at least two
-classes. `min_count` is the minimum activation count over the dataset.
+| Data field | Meaning |
+| --- | --- |
+| `activation_count` | Binary activations across all valid-target documents. |
+| `category_count` | Binary activations within this category. |
+| `category_mean` | Mean binary activation (prevalence) or raw score within this category. |
+| `reference_mean` | Corresponding mean outside this category. |
+| `effect` | Requested difference or ratio. Null value: 0 for differences, 1 for ratios. |
+| `low`, `high` | Confidence endpoints for `effect`. |
 
-For `kind='continuous'`, drops nonfinite numeric targets and ranks by the lower
-bound on squared Pearson correlation. Requires more than four valid
-observations and a variable target. Returns `count`, signed `correlation`,
-`R2`, `low`, `high`, and `R2_LCB`. Bounds use an approximate Fisher-z interval;
-`min_count` is applied only to rows with valid targets, while the returned
-`count` reports activations over the full dataset.
+**Metadata:** `metric`, `activations`, `confidence_level`, `n_observations`,
+`n_dropped`, `category_size`, `reference_size`.
+**Order:** descending `low`, ties by concept ID. Up to `top_n` rows per category.
+Undefined ratios with zero reference means are excluded; a zero numerator
+receives an uninformative `[0, infinity]` interval.
 
-```python
-categorical = E.predictive(labels, kind='categorical', top_n=20, min_count=5)
-continuous = E.predictive(y_numeric, kind='continuous', top_n=20, min_count=5)
-```
+## `E.risk(labels, metric='difference', top_n=15, min_count=10, confidence_level=0.99, activations='binary')`
 
-### `E.lasso(y, kind='categorical', top_n=20, test_size=0.25, random_state=42)`
+For each category, compare its probability at concept activation 1 versus 0.
+In binary mode, these are observed category frequencies among active versus
+inactive documents. Raw mode fits a separate logistic regression per concept,
+then evaluates the fitted probabilities at raw scores 1 and 0.
 
-Fits an L1 model on eligible binary concepts, tuning regularization on training
-rows and evaluating on a random holdout of size `test_size`. `y` must align
-with matrix rows. Categorical targets use stratified splitting and
-`LogisticRegressionCV` with three-fold CV; continuous targets use `LassoCV`
-with five-fold CV. Supply complete targets and enough observations for the
-split and CV folds.
+Parameters have the same defaults and validation as `enrichment()`. Raw risk
+requires at least three valid documents. Always-active and always-inactive
+concepts are excluded in binary mode; raw mode requires varying raw scores.
 
-Returns `(fitted_model, metrics_dict, selected_concepts_dataframe)`:
+| Data field | Meaning |
+| --- | --- |
+| `activation_count` | Binary activations across all valid-target documents. |
+| `inactive_count` | `n_observations - activation_count`. In raw mode, this is descriptive; the fit uses every raw score. |
+| `risk_at_0` | Observed category probability among inactive documents, or fitted probability at raw score 0. |
+| `risk_at_1` | Observed category probability among active documents, or fitted probability at raw score 1. |
+| `effect` | `risk_at_1 - risk_at_0` or `risk_at_1 / risk_at_0`, according to `metric`. |
+| `low`, `high` | Confidence endpoints for `effect`. |
+| `coefficient` | Raw mode only: logistic slope in original score units (log-odds per unit score). |
+| `intercept` | Raw mode only: fitted category log-odds at score 0. |
 
-- Categorical metrics: `heldout_accuracy`, `heldout_balanced_accuracy`, and
-  `n_eligible_concepts`.
-- Continuous metrics: `heldout_R2`, `heldout_RMSE`, and `n_eligible_concepts`.
-- The table contains `target_class`, `concept_id`, `concept_label`, and
-  `coefficient`, ordered by absolute coefficient. `top_n` limits the displayed
-  nonzero coefficients; it does not limit how many concepts the model uses.
+**Metadata:** same fields as enrichment; raw mode also includes
+`excluded_concepts`, a dictionary mapping excluded concept IDs to `constant`,
+`separated`, `fit_failed`, `singular_information`, or `nonfinite_estimate`.
+Concepts failing `E.allowed` or `min_count` are not included in this dictionary.
 
-The fitted model expects `E.Z[:, E.allowed]` using the same eligible columns as
-at fitting time. For grouped evaluation or a limit on selected concepts, use
-`classifier()` or `regressor()`.
+**Order:** differences sort by `max(low, -high, 0)`, so negative associations
+can rank highly. Ratios sort by `low`. Ties use concept ID. Up to `top_n` rows
+per category. Binary ratios with zero reference probability are excluded.
 
-```python
-model, metrics, concepts = E.lasso(labels, kind='categorical', top_n=20)
-```
+Raw endpoint probabilities can extrapolate beyond the observed scores.
+Exponentiating the logistic coefficient gives an odds ratio, distinct from
+`effect` with `metric='ratio'`.
 
-### `E.classifier(y, n_concepts=5, min_count=10, test_size=0.2, scoring='balanced_accuracy', random_state=42, groups=None)`
+## `E.joint(y, kind='categorical', n_concepts=20, min_count=10, activations='binary', random_state=42)`
 
-Fits a binary classifier using up to `n_concepts`. A training-fold frequency
-filter keeps concepts activating in at least `min_count` documents, L1 logistic
-regression selects features, and regularized logistic regression refits on
-those features. Three-fold CV tunes both selection and refit regularization
-using `scoring`. The final test data are held out from tuning.
+Select concepts jointly by tuning an L1 penalty toward `n_concepts` nonzero
+coefficients. Uses all valid-target documents and eligible, variable features.
+It returns selection results; it does not estimate held-out performance.
 
-`y` must have one value per document and exactly two nonmissing classes;
-missing targets are removed. At least 12 valid observations are required, with
-enough examples of each class for the holdout and CV folds. Pass a document-aligned
-`groups` array, such as author IDs, for grouped holdout and grouped CV. Otherwise,
-the method uses a stratified random holdout. `test_size` controls the holdout
-fraction (the fraction of groups when grouped), and `random_state` controls
-randomized operations.
+| Parameter | Meaning |
+| --- | --- |
+| `y` | One target per original document. |
+| `kind` | `'categorical'`: L1 logistic regression, requiring exactly two classes. `'continuous'`: Lasso, requiring numeric targets that vary. |
+| `n_concepts` | Positive integer requested support size. Returns the closest count found if an exact match is unavailable. |
+| `min_count` | Minimum binary activations among valid-target documents. |
+| `activations` | `'binary'` or `'raw'`. Features are scaled to unit variance during selection. Raw selection requires finite scores; unlike raw comparisons, it does not require `[0, 1]`. |
+| `random_state` | Solver random seed. |
 
-Returns `(fitted_pipeline, metrics, selected_concepts_dataframe)`. Metrics include
-`cv_score`, `best_params`, `scoring`, `n_train`, `n_test`, `n_selected`,
-`n_eligible_concepts`, `test_balanced_accuracy`, and `test_auc`. The selected
-table contains `concept_id`, `concept_label`, `train_count`, and the refitted
-`coefficient`, sorted by absolute coefficient, plus `fidelity` when available.
+| Data field | Meaning |
+| --- | --- |
+| `activation_count` | Binary activations among valid-target documents. |
+| `coefficient` | Selected L1 coefficient converted to original activation units, retaining shrinkage. Positive categorical coefficients favor `positive_class`. Continuous coefficients measure target change per unit activation, holding other selected features fixed. |
 
-The pipeline consumes `E.Z[:, E.allowed]` with the same eligible columns and
-ordering used at fitting time.
+**Order:** descending absolute coefficient, ties by concept ID. The result may
+contain fewer or more than `n_concepts`, including zero. No features are padded
+or truncated. Raises `ValueError` if no eligible variable features remain.
 
-```python
-model, metrics, concepts = E.classifier(y, n_concepts=5, groups=author_ids)
-predictions = model.predict(E.Z[:, E.allowed])
-```
-
-### `E.regressor(y, n_concepts=5, min_count=10, test_size=0.2, scoring='r2', random_state=42, groups=None)`
-
-Fits a numerical-target model using up to `n_concepts`, with training-fold
-frequency filtering, Lasso-based feature selection, and Ridge refitting.
-Three-fold CV tunes selection and refit regularization using `scoring`, and a
-separate holdout provides the final evaluation. Filtering and selection occur
-within CV folds.
-
-`y` must contain one numeric value per document. Nonfinite targets are removed;
-at least 12 valid observations and a variable target are required. `min_count`,
-`test_size`, `random_state`, and `groups` work as described under `classifier()`,
-except that the ungrouped holdout and CV splits are unstratified.
-
-Returns `(fitted_pipeline, metrics, selected_concepts_dataframe)`. Metrics include
-`cv_score`, `best_params`, `scoring`, `n_train`, `n_test`, `n_selected`,
-`n_eligible_concepts`, `test_r2`, and `test_mae`. The selected table has the same
-columns and ordering as `classifier()`; coefficients are in the target's units.
-The pipeline expects the same eligible binary columns used during fitting.
+| Metadata field | Meaning |
+| --- | --- |
+| `kind`, `activations` | Requested target kind and activation mode. |
+| `n_observations`, `n_dropped` | Documents used and omitted because of invalid targets. |
+| `n_requested`, `n_selected` | Requested and actual selected count. |
+| `exact_match` | Whether the counts match. |
+| `penalty` | Selected `{'C': value}` for categorical or `{'alpha': value}` for continuous targets. |
+| `n_fits` | Number of penalty values evaluated. |
+| `n_eligible_concepts` | Candidate count after filtering constant features. |
+| `coefficient_tolerance` | Threshold on standardized coefficients used to define a nonzero. |
+| `positive_class` | Categorical only: second class in sorted class order. |
 
 ```python
-model, metrics, concepts = E.regressor(y_numeric, n_concepts=5, groups=author_ids)
-predictions = model.predict(E.Z[:, E.allowed])
+selected = E.joint(y, n_concepts=5)
+print(selected['metadata']['n_selected'], selected['metadata']['exact_match'])
+table = pd.DataFrame(selected['data'])
 ```

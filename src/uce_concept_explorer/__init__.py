@@ -1,3 +1,3 @@
-from .explorer import ConceptExplorer, load_metadata
+from .explorer import ConceptExplorer
 
-__all__ = ["ConceptExplorer", "load_metadata"]
+__all__ = ["ConceptExplorer"]
